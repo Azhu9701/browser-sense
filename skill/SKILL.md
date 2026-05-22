@@ -38,6 +38,36 @@ curl -s http://127.0.0.1:19000/audit
 # → [{"ts":"2026-05-22T12:21:20Z","action":"navigate","ok":true}, ...]
 ```
 
+## Page State (Computer Use-like)
+
+One-call get full page context — screenshot + text + type detection + interactive elements:
+
+```bash
+curl -s "http://127.0.0.1:19000/state"
+# → {url, title, pageType, schema, text, interactiveElements, headings, screenshot}
+
+# With annotations
+curl -s "http://127.0.0.1:19000/state?annotate=true"
+```
+
+## Task Runner
+
+Execute a sequence of operations in one call — like Computer Use's action loop:
+
+```bash
+curl -s -X POST http://127.0.0.1:19000/run \
+  -d '{
+    "steps": [
+      {"action": "navigate", "args": {"url": "https://example.com"}},
+      {"action": "sleep", "args": {"ms": 2000}},
+      {"action": "detect"},
+      {"action": "screenshot"}
+    ]
+  }'
+```
+
+Supported step actions: `navigate`, `click`, `fill`, `scroll`, `press_key`, `execute`, `screenshot`, `wait_for`, `sleep`, `read`, `detect`, `snapshot`, `upload`, `sniff_auto`.
+
 - `extensionConnected: true` → healthy, proceed
 - Otherwise → start daemon: `bun ~/browser-sense/daemon/server.js`, then reload extension
 

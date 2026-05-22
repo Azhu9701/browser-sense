@@ -109,6 +109,45 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname === '/state' && req.method === 'GET') {
+      // One-call page state: screenshot + read + detect + snapshot
+      const annotate = url.searchParams.get('annotate') === 'true';
+
+      const [shot, text, detected, snap] = await Promise.all([
+        sendToExtension({ action: 'screenshot', args: { format: 'png', annotate } }),
+        sendToExtension({ action: 'read' }),
+        sendToExtension({ action: 'detect' }),
+        sendToExtension({ action: 'snapshot' })
+      ]);
+
+      let screenshotPath = null;
+      if (shot.ok && shot.data?.dataUrl) {
+        const matches = shot.data.dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+        if (matches) {
+          const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+          const buf = Buffer.from(matches[2], 'base64');
+          const suffix = annotate ? '-annotated' : '';
+          screenshotPath = `${SCREENSHOT_DIR}/${Date.now()}${suffix}.${ext}`;
+          await writeFile(screenshotPath, buf);
+        }
+      }
+
+      json(res, {
+        ok: true,
+        data: {
+          url: text.data?.url || detected.data?.url,
+          title: text.data?.title || detected.data?.title,
+          pageType: detected.data?.type,
+          schema: detected.data?.schema,
+          text: text.data?.text?.slice(0, 5000),
+          interactiveElements: snap.data?.interactive?.slice(0, 50),
+          headings: snap.data?.headings?.slice(0, 20),
+          screenshot: screenshotPath
+        }
+      });
+      return;
+    }
+
     if (url.pathname === '/screenshot' && req.method === 'GET') {
       const annotate = url.searchParams.get('annotate') === 'true';
       const result = await sendToExtension({ action: 'screenshot', args: { annotate } });
@@ -338,6 +377,109 @@ const server = createServer(async (req, res) => {
       }
 
       json(res, { ok: true, name, stepsPlayed: results.length, results });
+      return;
+    }
+
+    if (url.pathname === '/run' && req.method === 'POST') {
+      const args = await readBody(req);
+      const steps = args.steps || [];
+      const stepDelay = args.delay || 500;
+      const stopOnError = args.stopOnError !== false;
+      const results = [];
+
+      for (const step of steps) {
+        let result;
+        switch (step.action) {
+          case 'navigate':
+            result = await sendToExtension({ action: 'navigate', args: step.args });
+            break;
+          case 'click':
+            result = await sendToExtension({ action: 'click', args: step.args });
+            break;
+          case 'fill':
+            result = await sendToExtension({ action: 'fill', args: step.args });
+            break;
+          case 'scroll':
+            result = await sendToExtension({ action: 'scroll', args: step.args });
+            break;
+          case 'press_key':
+            result = await sendToExtension({ action: 'press_key', args: step.args });
+            break;
+          case 'execute':
+            result = await sendToExtension({ action: 'execute', args: step.args });
+            break;
+          case 'screenshot':
+            result = await sendToExtension({ action: 'screenshot', args: step.args || {} });
+            if (result.ok && result.data?.dataUrl) {
+              const matches = result.data.dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+              if (matches) {
+                const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+                const buf = Buffer.from(matches[2], 'base64');
+                const path = `${SCREENSHOT_DIR}/${Date.now()}.${ext}`;
+                await writeFile(path, buf);
+                result.data = { path };
+              }
+            }
+            break;
+          case 'wait_for':
+            result = { ok: false, error: 'timeout' };
+            const wfStart = Date.now();
+            while (Date.now() - wfStart < (step.args?.timeout || 10000)) {
+              let found = false;
+              try {
+                if (step.args?.selector) {
+                  const r = await sendToExtension({ action: 'execute', args: { code: `!!document.querySelector("${step.args.selector.replace(/"/g, '\\"')}")` } });
+                  found = r.ok && r.data === true;
+                } else if (step.args?.text) {
+                  const r = await sendToExtension({ action: 'execute', args: { code: `document.body.innerText.includes("${step.args.text.replace(/"/g, '\\"')}")` } });
+                  found = r.ok && r.data === true;
+                }
+              } catch {}
+              if (found) { result = { ok: true }; break; }
+              await new Promise(r => setTimeout(r, step.args?.interval || 500));
+            }
+            break;
+          case 'sleep':
+            await new Promise(r => setTimeout(r, step.args?.ms || 1000));
+            result = { ok: true };
+            break;
+          case 'read':
+            result = await sendToExtension({ action: 'read' });
+            break;
+          case 'detect':
+            result = await sendToExtension({ action: 'detect' });
+            break;
+          case 'snapshot':
+            result = await sendToExtension({ action: 'snapshot' });
+            break;
+          case 'upload':
+            result = await sendToExtension({ action: 'upload', args: step.args });
+            break;
+          case 'sniff_auto':
+            result = await sendToExtension({ action: 'sniff_start', args: {} });
+            if (result.ok) {
+              await sendToExtension({ action: 'navigate', args: { url: step.args.url }, tabId: result.data.tabId });
+              await new Promise(r => setTimeout(r, step.args?.wait || 3000));
+              const sniffData = await sendToExtension({ action: 'sniff_get', tabId: result.data.tabId });
+              await sendToExtension({ action: 'sniff_stop', tabId: result.data.tabId });
+              result = { ok: true, data: sniffData.data };
+            }
+            break;
+          default:
+            result = { ok: false, error: `unknown step: ${step.action}` };
+        }
+
+        results.push({ action: step.action, ok: result.ok, ...(result.ok ? { data: result.data } : { error: result.error }) });
+
+        if (!result.ok && stopOnError) {
+          break;
+        }
+        if (stepDelay > 0) {
+          await new Promise(r => setTimeout(r, stepDelay));
+        }
+      }
+
+      json(res, { ok: true, stepsExecuted: results.length, results });
       return;
     }
 
