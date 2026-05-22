@@ -12,7 +12,16 @@ const CONFIG_DIR = `${process.env.HOME}/.browser-sense`;
 const CONFIG_PATH = `${CONFIG_DIR}/config.json`;
 const AUDIT_LOG = `${CONFIG_DIR}/audit.log`;
 
-let config = { port: 19000, screenshotDir: '/tmp/browser-sense-screenshots' };
+let config = {
+  port: 19000,
+  screenshotDir: '/tmp/browser-sense-screenshots',
+  lmStudio: {
+    enabled: false,
+    url: 'http://127.0.0.1:1234/v1/chat/completions',
+    model: 'local-model',
+    maxSteps: 20
+  }
+};
 
 try {
   if (existsSync(CONFIG_PATH)) {
@@ -483,6 +492,159 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ── Computer Use — AI Autonomous Loop via LM Studio ──
+    if (url.pathname === '/computer_use' && req.method === 'POST') {
+      const args = await readBody(req);
+      const goal = args.goal;
+      if (!goal) { json(res, { ok: false, error: 'goal required' }); return; }
+
+      const lmUrl = config.lmStudio?.url || 'http://127.0.0.1:1234/v1/chat/completions';
+      const lmModel = config.lmStudio?.model || 'local-model';
+      const maxSteps = args.maxSteps || config.lmStudio?.maxSteps || 20;
+      const history = [];
+      const stepResults = [];
+
+      for (let step = 0; step < maxSteps; step++) {
+        // Wait for extension reconnect if disconnected
+        let reconnectWait = 0;
+        while (!extensionWs && reconnectWait < 15000) {
+          await new Promise(r => setTimeout(r, 500));
+          reconnectWait += 500;
+        }
+        if (!extensionWs) {
+          stepResults.push({ step, action: 'reconnect_timeout', error: 'extension not connected after 15s' });
+          break;
+        }
+
+        // 1. Get page state
+        const [shot, text, detected, snap] = await Promise.all([
+          sendToExtension({ action: 'screenshot', args: { format: 'png' } }),
+          sendToExtension({ action: 'read' }),
+          sendToExtension({ action: 'detect' }),
+          sendToExtension({ action: 'snapshot' })
+        ]);
+
+        const pageUrl = text.data?.url || detected.data?.url || 'unknown';
+        const pageTitle = text.data?.title || detected.data?.title || 'unknown';
+        const pageType = detected.data?.type || 'unknown';
+        const pageText = (text.data?.text || '').slice(0, 2000);
+        const elements = (snap.data?.interactive || []).slice(0, 30);
+        const headings = (snap.data?.headings || []).slice(0, 10);
+
+        // 2. Build prompt
+        const prompt = buildComputerUsePrompt({
+          goal, pageUrl, pageTitle, pageType, pageText, elements, headings, history
+        });
+
+        // 3. Call LM Studio
+        let llmResult;
+        try {
+          const lmRes = await fetch(lmUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: lmModel,
+              messages: [
+                { role: 'system', content: 'You are a browser automation assistant. Respond ONLY with valid JSON.' },
+                { role: 'user', content: prompt }
+              ],
+              temperature: 0.3,
+              max_tokens: 512
+            })
+          });
+          const lmData = await lmRes.json();
+          const content = lmData.choices?.[0]?.message?.content || '{}';
+          // Extract JSON from possible markdown
+          const jsonMatch = content.match(/\{[\s\S]*\}/);
+          llmResult = JSON.parse(jsonMatch ? jsonMatch[0] : content);
+        } catch (err) {
+          stepResults.push({ step, action: 'llm_error', error: err.message });
+          break;
+        }
+
+        // 4. Parse and execute
+        const action = llmResult.action;
+        const actionArgs = llmResult.args || {};
+
+        if (!action || action === 'done') {
+          stepResults.push({ step, action: 'done', reason: llmResult.reason });
+          break;
+        }
+
+        let execResult;
+        try {
+          switch (action) {
+            case 'navigate':
+              execResult = await sendToExtension({ action: 'navigate', args: actionArgs });
+              break;
+            case 'click':
+              execResult = await sendToExtension({ action: 'click', args: actionArgs });
+              break;
+            case 'fill':
+              execResult = await sendToExtension({ action: 'fill', args: actionArgs });
+              break;
+            case 'scroll':
+              execResult = await sendToExtension({ action: 'scroll', args: actionArgs });
+              break;
+            case 'press_key':
+              execResult = await sendToExtension({ action: 'press_key', args: actionArgs });
+              break;
+            case 'execute':
+              execResult = await sendToExtension({ action: 'execute', args: actionArgs });
+              break;
+            case 'screenshot':
+              execResult = await sendToExtension({ action: 'screenshot', args: actionArgs || {} });
+              break;
+            case 'wait_for':
+              execResult = { ok: false, error: 'timeout' };
+              const wfStart = Date.now();
+              while (Date.now() - wfStart < (actionArgs.timeout || 10000)) {
+                let found = false;
+                try {
+                  if (actionArgs.selector) {
+                    const r = await sendToExtension({ action: 'execute', args: { code: `!!document.querySelector("${actionArgs.selector.replace(/"/g, '\\"')}")` } });
+                    found = r.ok && r.data === true;
+                  } else if (actionArgs.text) {
+                    const r = await sendToExtension({ action: 'execute', args: { code: `document.body.innerText.includes("${actionArgs.text.replace(/"/g, '\\"')}")` } });
+                    found = r.ok && r.data === true;
+                  }
+                } catch {}
+                if (found) { execResult = { ok: true }; break; }
+                await new Promise(r => setTimeout(r, actionArgs.interval || 500));
+              }
+              break;
+            case 'sleep':
+              await new Promise(r => setTimeout(r, actionArgs.ms || 1000));
+              execResult = { ok: true };
+              break;
+            default:
+              execResult = { ok: false, error: `unknown action: ${action}` };
+          }
+        } catch (err) {
+          execResult = { ok: false, error: err.message };
+        }
+
+        history.push({ step, action, args: actionArgs, reason: llmResult.reason });
+        stepResults.push({ step, action, args: actionArgs, ok: execResult.ok, ...(execResult.ok ? {} : { error: execResult.error }) });
+
+        if (!execResult.ok) {
+          // LLM might recover next step
+          await new Promise(r => setTimeout(r, 1000));
+        } else {
+          await new Promise(r => setTimeout(r, 800));
+        }
+      }
+
+      json(res, {
+        ok: true,
+        goal,
+        steps: stepResults.length,
+        completed: stepResults.some(s => s.action === 'done'),
+        results: stepResults
+      });
+      return;
+    }
+
     if (url.pathname === '/config' && req.method === 'GET') {
       json(res, { ok: true, data: config });
       return;
@@ -638,6 +800,66 @@ function readBody(req) {
   });
 }
 
+// ── Computer Use Prompt Builder ──
+
+function buildComputerUsePrompt({ goal, pageUrl, pageTitle, pageType, pageText, elements, headings, history }) {
+  const elSummary = elements.map(e =>
+    `- ${e.ref || ''} ${e.tag || e.role} "${(e.name || e.text || '').slice(0, 60)}"`
+  ).join('\n');
+
+  const headSummary = headings.map(h => `- H${h.level}: ${h.text?.slice(0, 80)}`).join('\n');
+
+  const histSummary = history.length > 0
+    ? history.map(h => `- Step ${h.step}: ${h.action} ${JSON.stringify(h.args)} → ${h.reason || ''}`).join('\n')
+    : '(none)';
+
+  return `You are a browser automation assistant. Your job is to help the user achieve their goal by controlling a web browser.
+
+## Current Page
+- URL: ${pageUrl}
+- Title: ${pageTitle}
+- Type: ${pageType}
+
+## Page Content (first 2000 chars)
+${pageText}
+
+## Headings
+${headSummary}
+
+## Interactive Elements (top 30)
+${elSummary}
+
+## History of Actions
+${histSummary}
+
+## User Goal
+${goal}
+
+## Instructions
+Analyze the current page and decide the SINGLE next action to move toward the goal.
+
+Available actions (return as JSON):
+- {"action": "navigate", "args": {"url": "..."}, "reason": "..."}
+- {"action": "click", "args": {"selector": "@e0"}, "reason": "..."}
+- {"action": "fill", "args": {"selector": "@e1", "value": "..."}, "reason": "..."}
+- {"action": "scroll", "args": {"to": "bottom"}, "reason": "..."}
+- {"action": "press_key", "args": {"key": "Enter"}, "reason": "..."}
+- {"action": "wait_for", "args": {"selector": "...", "timeout": 5000}, "reason": "..."}
+- {"action": "sleep", "args": {"ms": 1000}, "reason": "..."}
+- {"action": "screenshot", "reason": "..."}
+- {"action": "done", "reason": "Goal achieved"}
+
+Rules:
+1. Use @e refs for click/fill when possible (from Interactive Elements list)
+2. If a search box exists, fill it and press Enter
+3. If you need to see more content, scroll
+4. If the goal is achieved, return {"action": "done"}
+5. Keep reason concise (1 sentence)
+6. Respond ONLY with valid JSON
+
+Next action:`;
+}
+
 // ── Start ──
 
 server.listen(PORT, () => {
@@ -645,4 +867,7 @@ server.listen(PORT, () => {
   console.log(`[Browser Sense] WebSocket: ws://127.0.0.1:${PORT}/ws`);
   console.log(`[Browser Sense] Events SSE: http://127.0.0.1:${PORT}/events`);
   console.log(`[Browser Sense] Screenshots: ${SCREENSHOT_DIR}/`);
+  if (config.lmStudio?.enabled) {
+    console.log(`[Browser Sense] LM Studio: ${config.lmStudio.url} (Computer Use enabled)`);
+  }
 });
