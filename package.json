@@ -1,0 +1,28 @@
+{
+  "name": "browser-sense",
+  "version": "0.1.0",
+  "description": "AI-native browser sensing layer with API sniffing, page detection, recording/replay, and visual-semantic screenshots",
+  "main": "daemon/server.js",
+  "scripts": {
+    "start": "bun daemon/server.js",
+    "mcp": "bun daemon/mcp-server.js"
+  },
+  "keywords": [
+    "browser-automation",
+    "ai-agent",
+    "api-sniffing",
+    "mcp",
+    "chrome-extension",
+    "web-scraping",
+    "browser-control"
+  ],
+  "author": "A Zhu",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

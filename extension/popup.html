@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 240px; padding: 12px; font-family: system-ui; font-size: 13px; }
+    .status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .dot.green { background: #4CAF50; }
+    .dot.red { background: #F44336; }
+    .dot.yellow { background: #FF9800; }
+    .info { color: #666; font-size: 12px; margin-top: 4px; }
+    button { width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; margin-top: 4px; }
+    button:hover { background: #f5f5f5; }
+  </style>
+</head>
+<body>
+  <div class="status">
+    <div class="dot" id="dot"></div>
+    <span id="label">Checking...</span>
+  </div>
+  <div class="info" id="detail"></div>
+  <button id="sniff">Toggle API Sniffing</button>
+  <button id="test">Test Connection</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>
