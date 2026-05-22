@@ -3,13 +3,42 @@
 // Relays commands to Chrome extension, pushes events to AI clients
 
 import { createServer } from 'http';
-import { writeFile, mkdir, readFile, readdir } from 'fs/promises';
+import { writeFile, mkdir, readFile, readdir, appendFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 
-const PORT = 19000;
-const SCREENSHOT_DIR = '/tmp/browser-sense-screenshots';
+// ── Config ──
+const CONFIG_DIR = `${process.env.HOME}/.browser-sense`;
+const CONFIG_PATH = `${CONFIG_DIR}/config.json`;
+const AUDIT_LOG = `${CONFIG_DIR}/audit.log`;
+
+let config = { port: 19000, screenshotDir: '/tmp/browser-sense-screenshots' };
+
+try {
+  if (existsSync(CONFIG_PATH)) {
+    config = { ...config, ...JSON.parse(await readFile(CONFIG_PATH, 'utf-8')) };
+  }
+} catch {}
+
+const PORT = config.port;
+const SCREENSHOT_DIR = config.screenshotDir;
 const RECORDINGS_DIR = `${process.env.HOME}/browser-sense/recordings`;
+
+await mkdir(CONFIG_DIR, { recursive: true });
+await mkdir(SCREENSHOT_DIR, { recursive: true });
+await mkdir(RECORDINGS_DIR, { recursive: true });
+
+// ── Audit Log ──
+async function audit(action, args, result) {
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    action,
+    args: typeof args === 'object' ? JSON.stringify(args).slice(0, 500) : String(args).slice(0, 500),
+    ok: result?.ok
+  }) + '\n';
+  try { await appendFile(AUDIT_LOG, line); } catch {}
+}
+
 let extensionWs = null;
 const aiClients = new Map(); // id -> ws
 let lastAutoSniffData = null;
@@ -18,9 +47,6 @@ let lastAutoSniffData = null;
 let isRecording = false;
 let currentRecording = [];
 let recordingName = null;
-
-await mkdir(SCREENSHOT_DIR, { recursive: true });
-await mkdir(RECORDINGS_DIR, { recursive: true });
 
 // ── HTTP Server ──
 
@@ -172,6 +198,64 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname === '/upload' && req.method === 'POST') {
+      const args = await readBody(req);
+      const result = await sendToExtension({
+        action: 'upload',
+        args: {
+          selector: args.selector || 'input[type="file"]',
+          files: args.files || []
+        }
+      });
+      json(res, result);
+      return;
+    }
+
+    if (url.pathname === '/scroll' && req.method === 'POST') {
+      const args = await readBody(req);
+      const result = await sendToExtension({ action: 'scroll', args });
+      json(res, result);
+      return;
+    }
+
+    if (url.pathname === '/press_key' && req.method === 'POST') {
+      const args = await readBody(req);
+      const result = await sendToExtension({ action: 'press_key', args });
+      json(res, result);
+      return;
+    }
+
+    if (url.pathname === '/wait_for' && req.method === 'POST') {
+      const args = await readBody(req);
+      const selector = args.selector;
+      const text = args.text;
+      const timeout = args.timeout || 10000;
+      const interval = args.interval || 500;
+
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+        let found = false;
+        try {
+          if (selector) {
+            const result = await sendToExtension({ action: 'execute', args: { code: `!!document.querySelector("${selector.replace(/"/g, '\\"')}")` } });
+            found = result.ok && result.data === true;
+          } else if (text) {
+            const result = await sendToExtension({ action: 'execute', args: { code: `document.body.innerText.includes("${text.replace(/"/g, '\\"')}")` } });
+            found = result.ok && result.data === true;
+          }
+        } catch {}
+
+        if (found) {
+          json(res, { ok: true, waited: Date.now() - start });
+          return;
+        }
+        await new Promise(r => setTimeout(r, interval));
+      }
+
+      json(res, { ok: false, error: `timeout after ${timeout}ms` });
+      return;
+    }
+
     if (url.pathname === '/execute' && req.method === 'POST') {
       const args = await readBody(req);
       // Support: {"code": "..."} or raw JS string or {"file": "/path/to/script.js"}
@@ -257,6 +341,29 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname === '/config' && req.method === 'GET') {
+      json(res, { ok: true, data: config });
+      return;
+    }
+
+    if (url.pathname === '/config' && req.method === 'POST') {
+      const updates = await readBody(req);
+      config = { ...config, ...updates };
+      await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2));
+      json(res, { ok: true, data: config });
+      return;
+    }
+
+    if (url.pathname === '/audit' && req.method === 'GET') {
+      try {
+        const lines = (await readFile(AUDIT_LOG, 'utf-8')).split('\n').filter(Boolean).slice(-100);
+        json(res, { ok: true, data: lines.map(l => JSON.parse(l)) });
+      } catch {
+        json(res, { ok: true, data: [] });
+      }
+      return;
+    }
+
     if (url.pathname === '/events' && req.method === 'GET') {
       // SSE stream for AI clients to receive push events
       res.writeHead(200, {
@@ -323,6 +430,7 @@ let commandCounter = 0;
 function sendToExtension(msg) {
   return new Promise((resolve, reject) => {
     if (!extensionWs) {
+      audit(msg.action, msg.args, { ok: false });
       resolve({ ok: false, error: 'extension not connected' });
       return;
     }
@@ -330,6 +438,7 @@ function sendToExtension(msg) {
     const id = ++commandCounter;
     const timeout = setTimeout(() => {
       pendingCommands.delete(id);
+      audit(msg.action, msg.args, { ok: false });
       resolve({ ok: false, error: 'timeout (10s)' });
     }, 10000);
 
@@ -344,6 +453,7 @@ function sendToExtension(msg) {
         extensionWs.off('message', handler);
         clearTimeout(timeout);
         pendingCommands.delete(id);
+        audit(msg.action, msg.args, resp);
         resolve(resp);
       }
     };

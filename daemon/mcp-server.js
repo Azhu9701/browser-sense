@@ -154,6 +154,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'browser_close_tab',
       description: 'Close current tab',
       inputSchema: { type: 'object', properties: {} }
+    },
+    {
+      name: 'browser_scroll',
+      description: 'Scroll page or element. Use to: bottom, top, or by deltaY.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', enum: ['bottom', 'top'], description: 'Scroll direction' },
+          deltaY: { type: 'number', description: 'Pixels to scroll' },
+          selector: { type: 'string', description: 'Element to scroll (default: page)' }
+        }
+      }
+    },
+    {
+      name: 'browser_press_key',
+      description: 'Press a key (Enter, Escape, Tab, ArrowUp, etc.)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Key name (e.g. Enter, Escape, Tab)' },
+          ctrlKey: { type: 'boolean' },
+          shiftKey: { type: 'boolean' }
+        },
+        required: ['key']
+      }
+    },
+    {
+      name: 'browser_wait_for',
+      description: 'Wait for element or text to appear on page',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector to wait for' },
+          text: { type: 'string', description: 'Text to wait for in page body' },
+          timeout: { type: 'number', description: 'Timeout in ms (default 10000)' }
+        }
+      }
+    },
+    {
+      name: 'browser_upload',
+      description: 'Upload files to a file input element via CDP',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'File input selector (default: input[type="file"])' },
+          files: { type: 'array', items: { type: 'string' }, description: 'Array of absolute file paths' }
+        },
+        required: ['files']
+      }
     }
   ]
 }));
@@ -216,6 +265,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case 'browser_close_tab':
         result = await api('/command', 'POST', { action: 'close_tab' });
+        break;
+      case 'browser_scroll':
+        result = await api('/scroll', 'POST', args);
+        break;
+      case 'browser_press_key':
+        result = await api('/press_key', 'POST', args);
+        break;
+      case 'browser_wait_for':
+        result = await api('/wait_for', 'POST', args);
+        break;
+      case 'browser_upload':
+        result = await api('/upload', 'POST', args);
         break;
       default:
         return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };

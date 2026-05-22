@@ -255,6 +255,41 @@
         break;
       }
 
+      case 'scroll': {
+        const el = msg.selector ? resolveElement(msg.selector) : document.documentElement;
+        if (!el) { sendResponse({ ok: false, error: 'element not found' }); break; }
+        const behavior = msg.behavior || 'smooth';
+        if (msg.to === 'bottom') {
+          el.scrollTo({ top: el.scrollHeight, behavior });
+        } else if (msg.to === 'top') {
+          el.scrollTo({ top: 0, behavior });
+        } else if (msg.deltaY !== undefined) {
+          el.scrollBy({ top: msg.deltaY, left: msg.deltaX || 0, behavior });
+        } else if (msg.y !== undefined) {
+          el.scrollTo({ top: msg.y, left: msg.x || 0, behavior });
+        } else {
+          el.scrollIntoView({ behavior, block: 'center' });
+        }
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'press_key': {
+        const key = msg.key;
+        const target = document.activeElement || document.body;
+        const eventInit = { key, bubbles: true, cancelable: true };
+        if (msg.ctrlKey) eventInit.ctrlKey = true;
+        if (msg.shiftKey) eventInit.shiftKey = true;
+        if (msg.altKey) eventInit.altKey = true;
+        target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+        target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+        if (key.length === 1 && !msg.ctrlKey && !msg.altKey) {
+          target.dispatchEvent(new InputEvent('input', { data: key, inputType: 'insertText', bubbles: true }));
+        }
+        sendResponse({ ok: true, key, target: target.tagName });
+        break;
+      }
+
       default:
         sendResponse({ error: 'unknown command' });
     }

@@ -4,17 +4,26 @@
 const DAEMON_WS_URL = 'ws://127.0.0.1:19000/ws';
 let ws = null;
 let reconnectTimer = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 30;
+const BASE_RECONNECT_DELAY = 1000;
 let sniffingTabs = new Map();
+let debuggerAttachedTabs = new Set();
 
-// ── WebSocket Connection ──
+// ── WebSocket Connection with Exponential Backoff ──
 
 function connectDaemon() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    updateBadge('red');
+    return;
+  }
 
   try {
     ws = new WebSocket(DAEMON_WS_URL);
 
     ws.onopen = () => {
+      reconnectAttempts = 0;
       ws.send(JSON.stringify({ type: 'register', role: 'extension', version: '0.1.0' }));
       updateBadge('green');
     };
@@ -23,11 +32,23 @@ function connectDaemon() {
       await handleCommand(JSON.parse(event.data));
     };
 
-    ws.onclose = () => { updateBadge('red'); reconnectTimer = setTimeout(connectDaemon, 3000); };
-    ws.onerror = () => { updateBadge('red'); };
+    ws.onclose = () => {
+      updateBadge('red');
+      scheduleReconnect();
+    };
+    ws.onerror = () => {
+      updateBadge('red');
+    };
   } catch {
-    reconnectTimer = setTimeout(connectDaemon, 3000);
+    scheduleReconnect();
   }
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectAttempts++;
+  const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts), 30000);
+  reconnectTimer = setTimeout(connectDaemon, delay);
 }
 
 function sendToDaemon(msg) {
@@ -134,7 +155,10 @@ async function handleCommand(msg) {
           domain: tabDomain,
           filters: msg.args?.filters || []
         });
-        await chrome.debugger.attach({ tabId: tid }, '1.3');
+        if (!debuggerAttachedTabs.has(tid)) {
+          await chrome.debugger.attach({ tabId: tid }, '1.3');
+          debuggerAttachedTabs.add(tid);
+        }
         await chrome.debugger.sendCommand({ tabId: tid }, 'Network.enable');
         res = { id: msg.id, ok: true, data: { tabId: tid, domain: tabDomain } };
         break;
@@ -144,6 +168,7 @@ async function handleCommand(msg) {
         const tid = msg.tabId || await activeTab();
         const data = sniffingTabs.get(tid);
         try { await chrome.debugger.detach({ tabId: tid }); } catch {}
+        debuggerAttachedTabs.delete(tid);
         sniffingTabs.delete(tid);
         res = { id: msg.id, ok: true, data: data?.requests || [] };
         break;
@@ -177,6 +202,68 @@ async function handleCommand(msg) {
         const tid = msg.tabId || await activeTab();
         await chrome.tabs.remove(tid);
         res = { id: msg.id, ok: true };
+        break;
+      }
+
+      case 'scroll': {
+        const tid = msg.tabId || await activeTab();
+        res = { id: msg.id, ok: true, data: await chrome.tabs.sendMessage(tid, { type: 'scroll', ...msg.args }) };
+        break;
+      }
+
+      case 'press_key': {
+        const tid = msg.tabId || await activeTab();
+        res = { id: msg.id, ok: true, data: await chrome.tabs.sendMessage(tid, { type: 'press_key', ...msg.args }) };
+        break;
+      }
+
+      // ── File Upload via CDP ──
+      case 'upload': {
+        const tid = msg.tabId || await activeTab();
+        const selector = msg.args?.selector || 'input[type="file"]';
+        const files = msg.args?.files;
+        if (!files || !files.length) {
+          res = { id: msg.id, ok: false, error: 'files array required' };
+          break;
+        }
+
+        const wasAttached = debuggerAttachedTabs.has(tid);
+
+        try {
+          if (!wasAttached) {
+            await chrome.debugger.attach({ tabId: tid }, '1.3');
+            debuggerAttachedTabs.add(tid);
+          }
+
+          // Get root document
+          const { root } = await chrome.debugger.sendCommand({ tabId: tid }, 'DOM.getDocument', { depth: 0 });
+
+          // Find the file input element
+          const { nodeId } = await chrome.debugger.sendCommand({ tabId: tid }, 'DOM.querySelector', {
+            nodeId: root.nodeId,
+            selector
+          });
+
+          if (!nodeId) {
+            res = { id: msg.id, ok: false, error: `file input not found: ${selector}` };
+            break;
+          }
+
+          // Set files
+          await chrome.debugger.sendCommand({ tabId: tid }, 'DOM.setFileInputFiles', {
+            nodeId,
+            files
+          });
+
+          res = { id: msg.id, ok: true, data: { files, selector } };
+        } catch (err) {
+          res = { id: msg.id, ok: false, error: err.message };
+        } finally {
+          if (!wasAttached) {
+            try { await chrome.debugger.detach({ tabId: tid }); } catch {}
+            debuggerAttachedTabs.delete(tid);
+          }
+        }
         break;
       }
 

@@ -16,6 +16,28 @@ AI-native browser control via local daemon at `http://127.0.0.1:19000`.
 curl -s http://127.0.0.1:19000/status
 ```
 
+## Configuration
+
+```bash
+# Read current config
+curl -s http://127.0.0.1:19000/config
+# → {"port":19000,"screenshotDir":"/tmp/browser-sense-screenshots"}
+
+# Update config (persisted to ~/.browser-sense/config.json)
+curl -s -X POST http://127.0.0.1:19000/config \
+  -d '{"defaultWait":5000}'
+```
+
+## Audit Log
+
+All commands are logged to `~/.browser-sense/audit.log`:
+
+```bash
+# View last 100 operations
+curl -s http://127.0.0.1:19000/audit
+# → [{"ts":"2026-05-22T12:21:20Z","action":"navigate","ok":true}, ...]
+```
+
 - `extensionConnected: true` → healthy, proceed
 - Otherwise → start daemon: `bun ~/browser-sense/daemon/server.js`, then reload extension
 
@@ -78,6 +100,24 @@ curl -s -X POST http://127.0.0.1:19000/command \
 # Fill input (handles input/textarea/contenteditable)
 curl -s -X POST http://127.0.0.1:19000/command \
   -d '{"action":"fill","args":{"selector":"@e4","value":"search query"}}'
+
+# Scroll — to bottom, top, or by pixels
+curl -s -X POST http://127.0.0.1:19000/scroll \
+  -d '{"to": "bottom"}'
+curl -s -X POST http://127.0.0.1:19000/scroll \
+  -d '{"deltaY": 800}'
+
+# Press key — Enter, Escape, Tab, ArrowUp, etc.
+curl -s -X POST http://127.0.0.1:19000/press_key \
+  -d '{"key": "Enter"}'
+
+# Wait for element or text to appear (avoids hardcoded sleep)
+curl -s -X POST http://127.0.0.1:19000/wait_for \
+  -d '{"selector": ".search-results", "timeout": 10000}'
+
+# Upload files via CDP (bypasses file dialog)
+curl -s -X POST http://127.0.0.1:19000/upload \
+  -d '{"selector": "input[type=file]", "files": ["/path/to/image.png"]}'
 
 # Execute JS — supports inline code, multi-line from file, or raw string
 curl -s -X POST http://127.0.0.1:19000/execute \
